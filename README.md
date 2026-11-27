@@ -25,20 +25,26 @@ the colour of fully transparent pixels.
    levels are few.
 3. **Filter search**: for each layout, every row is filtered with all five
    PNG filters, plus adaptive choices (minimum signed sum, fewest distinct
-   byte pairs, and brute force — per row, or per band of 8 / 16 rows, each
-   filter deflated against the 32 KiB written before it). Candidates are
-   ranked by TOTAL file bytes (deflate stream + `PLTE`/`tRNS` chunk
-   overhead), and the best three survive to the final deflate.
-4. **Compress**: the surviving candidates at zlib level 9, default and
-   `Z_FILTERED` strategies, then a memLevel 5–6 sweep on the winner.
+   byte pairs, and brute force — per row on narrow non-palette grey, or per
+   band of 8 / 16 rows, each filter deflated against the 32 KiB written
+   before it). Candidates are ranked by TOTAL file bytes (deflate stream +
+   `PLTE`/`tRNS` chunk overhead), and the best three survive to the final
+   deflate. Brute force runs on the cheapest layout only; heavy images
+   (cheapest level-6 total above 220,000 bytes) skip the 8-row bands.
+4. **Compress**: screen the three survivors cheaply (level 7, or 6 on heavy
+   images, at memLevel 5 for 1-channel / 6 otherwise, both strategies),
+   then level 9 only on the screening winner (3 calls normally, 1 call
+   plus a level-8 check on the alternate memLevel when heavy).
 5. **Write** a minimal PNG: `IHDR`, `PLTE`/`tRNS` only when needed, a
    single `IDAT`, `IEND`. A round-trip decode check (`Buffer.compare`) runs
    per instance; on any failure the program falls back to copying the
    (valid) input file, so every instance stays answered.
 
 Deterministic: fixed work only — no clock, no randomness, no environment
-input besides the input/output directory paths. A run takes ~28 s for the
-practice set (limit 60 s); peak memory ~335 MB (limit 512 MB).
+input besides the input/output directory paths. A run takes ~16 s of CPU
+for the practice set (limit 60 s); peak memory ~290 MB (limit 512 MB).
+Worst of 12 freshly drawn sets: 32.4 s CPU on a 1.92 MB draw (single-core
+wall 38 s, still inside the 60 s budget).
 
 ## Run
 
@@ -48,8 +54,9 @@ MAKEFUN_INPUT_DIR=practice/input MAKEFUN_OUTPUT_DIR=out node main.ts
 
 ## Practice result
 
-Score **719,206** (baseline fixed-paeth: 420,399; previous version of this
-entry: 700,915), all 8 instances answered exactly:
+Score **718,122** (baseline fixed-paeth: 420,399; previous version of this
+entry: 719,206 at ~28 s CPU — this version trades 1,084 points for a
+~42% CPU cut), all 8 instances answered exactly:
 
 | instance | theme | bytes | points |
 |----------|-------|------:|-------:|
@@ -59,10 +66,11 @@ entry: 700,915), all 8 instances answered exactly:
 | i004 | grey  | 105,110 | 699.304 |
 | i005 | flat  |  16,318 | 750.607 |
 | i006 | rich  | 176,625 | 697.859 |
-| i007 | alpha |  60,168 | 709.358 |
-| i008 | grey  |  24,539 | 723.061 |
+| i007 | alpha |  60,141 | 709.638 |
+| i008 | grey  |  24,899 | 714.108 |
 
-Also checked on three extra sets drawn with the kit generator (other seeds):
-712,687 / 737,376 / 730,221, all 8 instances exact each time; plus manual
-edge cases (grey with constant alpha 128, palette + `tRNS`, RGB + `tRNS`
-key, grey + varying alpha) all decode exactly with the kit's own decoder.
+Also checked on twelve extra sets drawn with the kit generator (other
+seeds): 712,215–740,456, all 8 instances exact each time; worst CPU
+32.4 s on the heaviest draw (1.92 MB scale sum). Plus manual edge cases
+(grey with constant alpha 128, palette + `tRNS`, RGB + `tRNS` key, grey +
+varying alpha) all decode exactly with the kit's own decoder.

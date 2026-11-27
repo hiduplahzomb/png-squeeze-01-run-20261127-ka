@@ -19,8 +19,9 @@
 //      ranked by TOTAL file bytes (deflate stream + PLTE/tRNS chunk
 //      overhead), not by the deflate stream alone; the best three survive
 //      to the final deflate.
-//   4. Final deflate: the three best surviving candidates at level 9, default
-//      and Z_FILTERED strategies, then a memLevel sweep (5-6) on the winner.
+//   4. Final deflate: screen the three survivors cheaply (level 7, or 6 on
+//      heavy images, at memLevel 5 for 1-channel / 6 otherwise), then level 9
+//      only on the screening winner (3 calls normally, 1 on heavy images).
 //   5. Write a minimal PNG: IHDR, PLTE/tRNS only when needed, one IDAT,
 //      IEND. A round-trip decode check (Buffer.compare) runs per instance;
 //      on any failure the program falls back to copying the input file.
@@ -407,7 +408,13 @@ function paletteLayouts(decoded: Decoded, an: Analysis): Layout[] {
   };
   push('first', [...idx]);
   push('freq', [...idx].sort(byFreq));
-  push('lum', [...idx].sort((a, b) => lum[a] - lum[b] || byFreq(a, b)));
+  push('lum', [...idx].sort((a, b) => {
+    // Transparent entries first (ascending alpha), then luminance for the
+    // opaque ones, so a palette tRNS stays short when this ordering wins.
+    const ta = A[a] < 255 ? 0 : 1;
+    const tb = A[b] < 255 ? 0 : 1;
+    return ta - tb || (ta === 0 ? A[a] - A[b] : lum[a] - lum[b]) || byFreq(a, b);
+  }));
   // Transparent entries first (ascending alpha) so tRNS stays short.
   push('trans', [...idx].sort((a, b) => A[a] - A[b] || byFreq(a, b)));
   push('spatial', spatialOrder(width, height, indexData, k, freq, seen));
@@ -462,8 +469,9 @@ function buildLayouts(decoded: Decoded, an: Analysis): Layout[] {
       }
       layouts.push({ colourType: 4, channels: 2, data, palette: null, trns: null, tag: 'grey-alpha' });
     }
-    // Palette as a rival to grey when the grey levels are few.
-    if (an.paletteable && an.greyLevels <= 256) layouts.push(...paletteLayouts(decoded, an));
+    // Palette as a rival to grey when the grey levels are few (<= 64: with
+    // more levels the PLTE overhead of up to 780 B can never win).
+    if (an.paletteable && an.greyLevels <= 64) layouts.push(...paletteLayouts(decoded, an));
     return layouts;
   }
 
@@ -635,8 +643,8 @@ function bruteStream(layout: Layout, width: number, height: number, bandRows: nu
       const dict = pos > 0 ? out.subarray(Math.max(0, pos - DICT_BYTES), pos) : undefined;
       const trial = band.subarray(0, rows * rowLen);
       const len = dict
-        ? deflateSync(trial, { level: 6, dictionary: dict }).length
-        : deflateSync(trial, { level: 6 }).length;
+        ? deflateSync(trial, { level: 6, memLevel: 6, dictionary: dict }).length
+        : deflateSync(trial, { level: 6, memLevel: 6 }).length;
       if (len < bestLen) {
         bestLen = len;
         bestF = f;
@@ -725,9 +733,7 @@ function squeezeOne(inputPath: string, outputPath: string): void {
 
     let cheapBestLayout: Layout | null = null;
     let cheapBestTotal = Infinity;
-    let lumLayout: Layout | null = null;
     for (const layout of layouts) {
-      if (layout.tag === 'pal-lum') lumLayout = layout;
       const streams = buildFilterStreams(layout, decoded.width, decoded.height);
       for (const stream of streams) {
         const total = totalBytes(layout, deflateSync(stream, { level: 6 }).length);
@@ -738,53 +744,78 @@ function squeezeOne(inputPath: string, outputPath: string): void {
         offer(stream, layout, total);
       }
     }
-    // Brute force on the cheapest layout, and on the luminance palette
-    // ordering when it is a different layout: per-row and per-band. The
-    // per-row brute force costs one deflate per row per filter, which only
-    // pays on narrow rows; wide layouts (RGB/RGBA) get the band brute
-    // forces alone, which won their pools in practice. Two band widths are
-    // tried: 8-row bands won some images, 16-row bands others (less
-    // myopic), so both stay as candidates.
-    const bruteTargets: Layout[] = [];
-    if (cheapBestLayout) bruteTargets.push(cheapBestLayout);
-    if (lumLayout && lumLayout !== cheapBestLayout) bruteTargets.push(lumLayout);
-    for (const layout of bruteTargets) {
+    // Deterministic "heavy image" flag from the cheap level-6 totals: no
+    // clock, no randomness. Heavy images get fewer brute bands and fewer
+    // level-9 calls, where one call costs ~1 s of CPU for ~100 points.
+    const heavy = cheapBestTotal > 220000;
+    // Brute force on the cheapest layout only (a second brute target never
+    // won a byte in practice): per-row and per-band. The per-row brute
+    // force costs one deflate per row per filter, which only pays on narrow
+    // non-palette grey rows; wide layouts (RGB/RGBA) get the band brute
+    // forces alone. Two band widths are tried: 8-row bands won some images,
+    // 16-row bands others (less myopic); heavy images skip the 8-row bands.
+    if (cheapBestLayout) {
+      const layout = cheapBestLayout;
       const stride = decoded.width * layout.channels;
-      if (stride <= 2048) offer(bruteStream(layout, decoded.width, decoded.height, 1), layout);
-      offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS), layout);
+      if (stride <= 2048 && layout.colourType !== 3 && !heavy) {
+        offer(bruteStream(layout, decoded.width, decoded.height, 1), layout);
+      }
+      if (!heavy) offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS), layout);
       offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS_WIDE), layout);
     }
     if (pool.length === 0) throw new Error('no candidate stream');
     pool.sort((a, b) => a.total - b.total || a.seq - b.seq);
 
-    // Final deflate: level 9, both strategies, for the three best surviving
-    // candidates; then a memLevel sweep on the winning stream. (Cutting the
-    // final to the top two cost 288 bytes on practice i005, whose winner was
-    // the third candidate, so all three stay.)
+    // Final deflate: screen the three surviving candidates cheaply first
+    // (level 7, or 6 when the image is heavy, at the memLevel that wins for
+    // the candidate's channel count: 5 for 1-channel, 6 otherwise), then
+    // level 9 only on the screening winner — 3 calls normally, 1 call plus
+    // a level-8 check on the alternate memLevel when heavy. A level-9 call
+    // on a big photo costs ~1 s of CPU, and memLevel 8 never won, so the old
+    // 10-call sweep (6 at memLevel 8, then 4 at 5/6) was pure waste.
+    // (Cutting the final to the top two cost 288 bytes on practice i005,
+    // whose winner was the third candidate, so all three stay in the pool.)
     let bestBuf: Buffer | null = null;
     let bestTotal = Infinity;
     let bestLayout: Layout | null = null;
-    let bestStream: Uint8Array | null = null;
-    const consider = (stream: Uint8Array, layout: Layout, memLevel: number, strategy: number): void => {
-      const buf = deflateSync(stream, { level: 9, memLevel, strategy });
+    const consider = (
+      stream: Uint8Array,
+      layout: Layout,
+      level: number,
+      memLevel: number,
+      strategy: number,
+    ): number => {
+      const buf = deflateSync(stream, { level, memLevel, strategy });
       const total = totalBytes(layout, buf.length);
       if (total < bestTotal) {
         bestTotal = total;
         bestBuf = buf;
         bestLayout = layout;
-        bestStream = stream;
       }
+      return total;
     };
+    const screenLevel = heavy ? 6 : 7;
+    let screenBest: { stream: Uint8Array; layout: Layout; ml: number; strategy: number } | null = null;
+    let screenBestTotal = Infinity;
     for (const cand of pool) {
-      consider(cand.stream, cand.layout, 8, constants.Z_DEFAULT_STRATEGY);
-      consider(cand.stream, cand.layout, 8, constants.Z_FILTERED);
+      const ml = cand.layout.channels === 1 ? 5 : 6;
+      for (const strategy of [constants.Z_DEFAULT_STRATEGY, constants.Z_FILTERED]) {
+        const total = consider(cand.stream, cand.layout, screenLevel, ml, strategy);
+        if (total < screenBestTotal) {
+          screenBestTotal = total;
+          screenBest = { stream: cand.stream, layout: cand.layout, ml, strategy };
+        }
+      }
     }
-    if (bestStream && bestLayout) {
-      // memLevel 5 and 6 won the sweep on every practice instance; 7 and 9
-      // never did, so the sweep stops there.
-      for (const memLevel of [5, 6]) {
-        consider(bestStream, bestLayout, memLevel, constants.Z_DEFAULT_STRATEGY);
-        consider(bestStream, bestLayout, memLevel, constants.Z_FILTERED);
+    if (screenBest) {
+      const alt = screenBest.ml === 5 ? 6 : 5;
+      if (!heavy) {
+        consider(screenBest.stream, screenBest.layout, 9, screenBest.ml, constants.Z_DEFAULT_STRATEGY);
+        consider(screenBest.stream, screenBest.layout, 9, screenBest.ml, constants.Z_FILTERED);
+        consider(screenBest.stream, screenBest.layout, 9, alt, screenBest.strategy);
+      } else {
+        consider(screenBest.stream, screenBest.layout, 9, screenBest.ml, screenBest.strategy);
+        consider(screenBest.stream, screenBest.layout, 8, alt, screenBest.strategy);
       }
     }
     if (!bestBuf || !bestLayout) throw new Error('no candidate stream');
