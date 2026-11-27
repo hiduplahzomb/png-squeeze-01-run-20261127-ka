@@ -745,36 +745,46 @@ function squeezeOne(inputPath: string, outputPath: string): void {
       }
     }
     // Deterministic "heavy image" flag from the cheap level-6 totals: no
-    // clock, no randomness. Heavy images get fewer brute bands and fewer
-    // level-9 calls, where one call costs ~1 s of CPU for ~100 points.
-    const heavy = cheapBestTotal > 220000;
+    // clock, no randomness. The threshold is channel-aware: a 1-channel
+    // (grey) layout burns nearly as much CPU per byte as a 3/4-channel one,
+    // so it goes heavy at 120 KB while the rest go heavy at 220 KB. Heavy
+    // images get one brute band and one level-9 call, where one call costs
+    // ~1 s of CPU for ~100 points.
+    const heavy = cheapBestTotal > (cheapBestLayout && cheapBestLayout.channels === 1 ? 120000 : 220000);
     // Brute force on the cheapest layout only (a second brute target never
     // won a byte in practice): per-row and per-band. The per-row brute
     // force costs one deflate per row per filter, which only pays on narrow
     // non-palette grey rows; wide layouts (RGB/RGBA) get the band brute
     // forces alone. Two band widths are tried: 8-row bands won some images,
-    // 16-row bands others (less myopic); heavy images skip the 8-row bands.
+    // 16-row bands others (less myopic). Heavy images run exactly ONE brute
+    // pass: bandRows 1 for narrow non-palette grey (it wins outright there),
+    // bandRows 16 otherwise.
     if (cheapBestLayout) {
       const layout = cheapBestLayout;
       const stride = decoded.width * layout.channels;
-      if (stride <= 2048 && layout.colourType !== 3 && !heavy) {
-        offer(bruteStream(layout, decoded.width, decoded.height, 1), layout);
+      const doRowBrute = stride <= 2048 && layout.colourType !== 3;
+      if (heavy) {
+        offer(bruteStream(layout, decoded.width, decoded.height, doRowBrute ? 1 : BRUTE_BAND_ROWS_WIDE), layout);
+      } else {
+        if (doRowBrute) offer(bruteStream(layout, decoded.width, decoded.height, 1), layout);
+        offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS), layout);
+        offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS_WIDE), layout);
       }
-      if (!heavy) offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS), layout);
-      offer(bruteStream(layout, decoded.width, decoded.height, BRUTE_BAND_ROWS_WIDE), layout);
     }
     if (pool.length === 0) throw new Error('no candidate stream');
     pool.sort((a, b) => a.total - b.total || a.seq - b.seq);
 
-    // Final deflate: screen the three surviving candidates cheaply first
+    // Final deflate: screen the surviving candidates cheaply first
     // (level 7, or 6 when the image is heavy, at the memLevel that wins for
-    // the candidate's channel count: 5 for 1-channel, 6 otherwise), then
-    // level 9 only on the screening winner — 3 calls normally, 1 call plus
-    // a level-8 check on the alternate memLevel when heavy. A level-9 call
-    // on a big photo costs ~1 s of CPU, and memLevel 8 never won, so the old
-    // 10-call sweep (6 at memLevel 8, then 4 at 5/6) was pure waste.
+    // the candidate's channel count: 5 for 1-channel, 6 otherwise — except
+    // heavy images, which screen only the top candidate at memLevel 6),
+    // then level 9 only on the screening winner — 3 calls normally, 1 call
+    // when heavy. A level-9 call on a big photo costs ~1 s of CPU, and
+    // memLevel 8 never won, so the old 10-call sweep (6 at memLevel 8,
+    // then 4 at 5/6) was pure waste.
     // (Cutting the final to the top two cost 288 bytes on practice i005,
-    // whose winner was the third candidate, so all three stay in the pool.)
+    // whose winner was the third candidate, so all three stay in the pool
+    // for non-heavy images.)
     let bestBuf: Buffer | null = null;
     let bestTotal = Infinity;
     let bestLayout: Layout | null = null;
@@ -797,8 +807,8 @@ function squeezeOne(inputPath: string, outputPath: string): void {
     const screenLevel = heavy ? 6 : 7;
     let screenBest: { stream: Uint8Array; layout: Layout; ml: number; strategy: number } | null = null;
     let screenBestTotal = Infinity;
-    for (const cand of pool) {
-      const ml = cand.layout.channels === 1 ? 5 : 6;
+    for (const cand of heavy ? pool.slice(0, 1) : pool) {
+      const ml = !heavy && cand.layout.channels === 1 ? 5 : 6;
       for (const strategy of [constants.Z_DEFAULT_STRATEGY, constants.Z_FILTERED]) {
         const total = consider(cand.stream, cand.layout, screenLevel, ml, strategy);
         if (total < screenBestTotal) {
@@ -815,7 +825,6 @@ function squeezeOne(inputPath: string, outputPath: string): void {
         consider(screenBest.stream, screenBest.layout, 9, alt, screenBest.strategy);
       } else {
         consider(screenBest.stream, screenBest.layout, 9, screenBest.ml, screenBest.strategy);
-        consider(screenBest.stream, screenBest.layout, 8, alt, screenBest.strategy);
       }
     }
     if (!bestBuf || !bestLayout) throw new Error('no candidate stream');
